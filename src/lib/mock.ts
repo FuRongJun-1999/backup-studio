@@ -6,6 +6,7 @@ import type {
   ScanResult,
   SyncMode,
 } from '../../shared/types';
+import type { AutoPair, AutoStatus } from '../../shared/aut-types';
 import type { BackupAPI, PlanPayload, ProgressPayload, StartOptions } from './api';
 
 type Handler<T> = (payload: T) => void;
@@ -71,6 +72,22 @@ export function createMockApi(): BackupAPI {
 
   let current = baseState();
   let timer: number | null = null;
+
+  // 自动备份的浏览器演示状态：不触碰真实文件系统。
+  let autoPair: AutoPair | null = null;
+  let autoEnabled = false;
+  const autoStatus = (): AutoStatus => ({
+    pair: autoPair,
+    state: autoEnabled ? 'idle' : 'off',
+    available: autoPair !== null,
+    polling: autoPair?.pollOnly ?? false,
+    pending: 0,
+    attempts: 0,
+    reason: autoPair ? '浏览器演示：未连接真实文件系统，不进行实际同步' : undefined,
+    recent: [],
+    recycle: [],
+    recycleBytes: 0,
+  });
 
   const pushLog = (level: LogEntry['level'], text: string) => {
     seq += 1;
@@ -221,6 +238,17 @@ export function createMockApi(): BackupAPI {
       return current;
     },
 
+    async health() {
+      return { assessment: { level: 'L1', confidence: 0.95, writable: false, at: Date.now(), suggestion: '演示卷需人工检查，保持只读。', evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now() }] }, condition: 'filesystem-repair', permission: true, volume: 'X:', smart: '能力缺失', index: '未验证', files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 } };
+    },
+    async reenumerate(root) { return this.health(root); },
+    async repairDryRun(_root, request) {
+      if (request.volume !== 'X:' || !request.confirmed || !request.confirmedAgain || !request.disclaimerAccepted) throw new Error('须选择作用卷并完成两次确认');
+      return { mode: 'dry-run', auditId: 'demo', volume: 'X:', imageCreated: false, guidance: '浏览器演示：未创建镜像或调用修复。' };
+    },
+    async exportPartitionEvidence() { return { auditId: 'demo', guidance: '浏览器演示：未写入文件。' }; },
+    async capabilities() { return (await import('../../electron/engine/capability')).capabilityMatrix; },
+
     async assess(_targetRoot: string) {
       return {
         assessment: {
@@ -253,6 +281,42 @@ export function createMockApi(): BackupAPI {
 
     async setTheme(mode) {
       return mode === 'light' ? 'light' : 'dark';
+    },
+
+    autoSync: {
+      async status() {
+        return autoStatus();
+      },
+      async configure(input) {
+        autoPair = {
+          id: 'demo-pair',
+          enabled: false,
+          sourceRoot: input.sourceRoot,
+          targetRoot: input.targetRoot,
+          excludes: input.excludes ?? [],
+          syncDeletes: input.syncDeletes ?? false,
+          retentionDays: input.retentionDays ?? 7,
+          recycleMaxBytes: input.recycleMaxBytes ?? 10 * 1024 ** 3,
+          externalChanges: input.externalChanges ?? 'pause',
+          pollOnly: input.pollOnly ?? false,
+          pollMs: input.pollMs ?? 30000,
+          stableMs: input.stableMs ?? 750,
+          allowSnapshotFiles: input.allowSnapshotFiles ?? false,
+        };
+        autoEnabled = false;
+        return autoStatus();
+      },
+      async setEnabled(enabled) {
+        if (enabled) autoEnabled = true;
+        else autoEnabled = false;
+        return autoStatus();
+      },
+      async resume() {
+        return autoStatus();
+      },
+      async restore() {
+        return autoStatus();
+      },
     },
 
     onState: (cb) => state.push(cb),

@@ -7,6 +7,7 @@ import type {
   ScanResult,
   SyncMode,
 } from '../../shared/types';
+import type { AutoSyncApi } from '../../shared/aut-types';
 
 export interface PlanPayload {
   actions: PlanAction[];
@@ -42,9 +43,15 @@ export interface BackupAPI {
   getState(): Promise<AppState>;
   cleanupMeta(): Promise<AppState>;
   assess(targetRoot: string): Promise<{ assessment: MediaAssessment; state: AppState }>;
+  health(targetRoot: string): Promise<import('../../shared/types').HealthReport>;
+  reenumerate(targetRoot: string): Promise<import('../../shared/types').HealthReport>;
+  repairDryRun(targetRoot: string, request: import('../../shared/types').RepairRequest): Promise<import('../../shared/types').RepairResult>;
+  exportPartitionEvidence(targetRoot: string): Promise<{ auditId: string; guidance: string }>;
+  capabilities(): Promise<import('../../shared/types').CapabilityRow[]>;
   recover(confirmed: boolean): Promise<AppState>;
   quarantine(reason: string): Promise<AppState>;
   releaseQuarantine(): Promise<AppState>;
+  autoSync: AutoSyncApi;
   reveal(targetPath: string): Promise<void>;
   setTheme(mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'>;
   onState(cb: (state: AppState) => void): () => void;

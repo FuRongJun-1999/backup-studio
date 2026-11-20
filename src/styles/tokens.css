@@ -70,6 +70,7 @@
 
 [data-theme='dark'] {
   color-scheme: dark;
+  --w-regular: 360;
 
   /* ---- 背景层级：暗色，禁纯黑 ---- */
   --bg-app: #0b0b0a;

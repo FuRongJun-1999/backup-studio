@@ -673,6 +673,159 @@ async function main(): Promise<void> {
     assert.ok(plan.confirmReason.length > 0);
   });
 
+  const { inspectHealth, inspectPartition } = await import('../electron/engine/health');
+  const { rehearseRepair } = await import('../electron/engine/repair');
+  const { readCommand, rawWindowsDevice, redactLog } = await import('../electron/engine/security');
+  const { capabilityMatrix } = await import('../electron/engine/capability');
+  const dirtySample = async (root: string, admin = false) => {
+    return inspectHealth(root, {
+      platform: 'win32', store: new JournalStore(root), quick: admin,
+      run: async (op) => {
+        if (op === 'admin') return admin ? '1' : '0';
+        if (op === 'dirty') return 'Volume - E: is Dirty';
+        if (op === 'volume') return JSON.stringify({ fileSystem: 'NTFS', volumeHealth: 'Warning', volumeStatus: ['Full Repair Needed'], bus: 'USB', partition: 'MBR', diskStatus: 'Online', offline: false, readOnly: false, physicalHealth: 'Healthy' });
+        throw new Error('Access denied');
+      },
+    });
+  };
+
+  await test('FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造', async () => {
+    // 只向假执行器传递盘符，真实文件系统只访问测试目录。
+    if (process.platform !== 'win32') return;
+    const result = await dirtySample(await makeTemp('bs-health-'));
+    assert.equal(result.assessment.level, 'L1');
+    assert.equal(result.assessment.writable, false);
+    assert.equal(result.condition, 'filesystem-repair');
+    assert.equal(result.smart, '能力缺失');
+    assert.ok(result.assessment.evidence.some((x) => x.detail.includes('Full Repair Needed')));
+    assert.ok(result.assessment.evidence.some((x) => x.detail.includes('脏位置位')));
+  });
+
+  await test('FR-06：探测不修改目标或本机账本，校验备份索引', async () => {
+    const target = await makeTemp('bs-readonly-');
+    const local = await makeTemp('bs-readonly-local-');
+    const source = await makeTemp('bs-src-');
+    await writeFile(source, 'test.bin', 'test');
+    await runService(source, target);
+    const manifest = path.join(target, '.backup-studio', 'manifest.json');
+    const before = await fs.readFile(manifest);
+    const changed = await fs.stat(manifest);
+    const result = await inspectHealth(target, { platform: 'linux', store: new JournalStore(local) });
+    assert.equal(result.files.complete, 1);
+    assert.equal(result.index, '完整');
+    assert.deepEqual(await fs.readFile(manifest), before);
+    assert.equal((await fs.stat(manifest)).mtimeMs, changed.mtimeMs);
+    assert.deepEqual(await fs.readdir(local), []);
+  });
+
+  await test('FR-06：只读校验 MBR 签名及条目边界', async () => {
+    const mbr = Buffer.alloc(512);
+    mbr.writeUInt16LE(0xaa55, 510); mbr[450] = 7;
+    mbr.writeUInt32LE(1, 454); mbr.writeUInt32LE(100, 458);
+    assert.match(await inspectPartition(async () => mbr, 512, 1024 * 1024), /MBR.*有效/);
+    mbr.writeUInt32LE(4000, 458);
+    assert.match(await inspectPartition(async () => mbr, 512, 1024 * 1024), /超出范围/);
+  });
+
+  await test('FR-06：GPT 验证主备头及分区条目 CRC32', async () => {
+    const { crc32 } = await import('../electron/engine/journal');
+    const checksum = (buf: Buffer) => Number.parseInt(crc32(buf.toString('latin1')), 16) >>> 0;
+    const image = Buffer.alloc(512 * 64);
+    image.writeUInt16LE(0xaa55, 510);
+    image[450] = 0xee;
+    for (const [lba, peer, tableLba] of [[1, 63, 2], [63, 1, 62]]) {
+      const header = image.subarray(lba * 512, (lba + 1) * 512);
+      const table = image.subarray(tableLba * 512, tableLba * 512 + 128);
+      header.write('EFI PART');
+      header.writeUInt32LE(92, 12);
+      header.writeBigUInt64LE(BigInt(lba), 24);
+      header.writeBigUInt64LE(BigInt(peer), 32);
+      header.writeBigUInt64LE(3n, 40);
+      header.writeBigUInt64LE(61n, 48);
+      header.writeBigUInt64LE(BigInt(tableLba), 72);
+      header.writeUInt32LE(1, 80);
+      header.writeUInt32LE(128, 84);
+      header.writeUInt32LE(checksum(table), 88);
+      header.writeUInt32LE(checksum(header.subarray(0, 92)), 16);
+    }
+    const read = async (offset: number, size: number) => image.subarray(offset, offset + size);
+    assert.match(await inspectPartition(read, 512, image.length), /CRC32 一致/);
+    image[62 * 512 + 5] = 1;
+    assert.match(await inspectPartition(read, 512, image.length), /CRC32.*失败/);
+  });
+
+  const repairReport = { permission: true, condition: 'filesystem-repair', volume: 'Q:', assessment: { level: 'L1' }, files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 } } as import('../shared/types').HealthReport;
+  const repairRequest = { volume: 'Q:', confirmed: true, confirmedAgain: true, disclaimerAccepted: true };
+  await test('FR-09：没有二次确认不启动只读预检、镜像或修复', async () => {
+    const local = await makeTemp('bs-repair-');
+    let calls = 0;
+    const fakeExecutor = async () => { calls++; return repairReport; };
+    await assert.rejects(rehearseRepair({ ...repairRequest, confirmedAgain: false }, fakeExecutor, async () => { calls++; return Buffer.alloc(512); }, local), /两次确认/);
+    assert.equal(calls, 0);
+    assert.deepEqual(await fs.readdir(local), []);
+  });
+
+  await test('FR-09：审计请求后先生成镜像，结果无修复命令', async () => {
+    const local = await makeTemp('bs-repair-');
+    const result = await rehearseRepair(repairRequest, async () => repairReport, async () => {
+      const [id] = await fs.readdir(local);
+      assert.deepEqual(await fs.readdir(path.join(local, id)), ['request.json']);
+      return Buffer.alloc(1024, 7);
+    }, local);
+    const dir = path.join(local, result.auditId);
+    const audit = JSON.parse(await fs.readFile(path.join(dir, 'result.json'), 'utf8'));
+    const image = JSON.parse(await fs.readFile(path.join(dir, audit.imagePath), 'utf8'));
+    assert.equal(result.mode, 'dry-run');
+    assert.equal(audit.command, null);
+    assert.equal(image.byteLength, 1024);
+  });
+
+  await test('FR-11：重复枚举失败触发可撤销的隔离观察', async () => {
+    const source = await makeTemp('bs-src-');
+    const target = await makeTemp('bs-target-');
+    const local = await makeTemp('bs-local-');
+    const svc = new BackupService(local);
+    await svc.plan(source, target, 'mirror');
+    await fs.rename(target, `${target}-moved`);
+    const report = await svc.reenumerate(target);
+    assert.equal(report.condition, 'unreachable');
+    await svc.reenumerate(target);
+    assert.equal(svc.getState().quarantine?.released, false);
+    assert.ok(report.assessment.evidence.some((x) => x.detail.includes('线缆')));
+    await svc.releaseQuarantine();
+    assert.equal(svc.getState().quarantine?.released, true);
+  });
+
+  await test('FR-15：权限不足拒绝高危演练但仍可查看卷证据', async () => {
+    const local = await makeTemp('bs-repair-');
+    await assert.rejects(rehearseRepair(repairRequest, async () => ({ ...repairReport, permission: false }), async () => { throw new Error('不应读取镜像'); }, local), /权限/);
+    if (process.platform === 'win32') {
+      const report = await dirtySample(local);
+      assert.equal(report.permission, false);
+      assert.ok(report.assessment.evidence.some((x) => x.kind === '权限'));
+    }
+  });
+
+  await test('FR-15：执行器和原始设备路径白名单不可注入', () => {
+    assert.throws(() => readCommand('volume', "Q';throw"), /无效/);
+    assert.throws(() => rawWindowsDevice('disk', '../disk'), /无效/);
+    assert.throws(() => readCommand('chkdsk' as 'volume', 'Q'), /白名单/);
+    assert.deepEqual(readCommand('dirty', 'Q').args, ['dirty', 'query', 'Q:']);
+  });
+
+  await test('FR-15：日志脱敏，配置允许路径但不允许凭据', () => {
+    const original = 'path="C:\\private folder\\stuff" token=visible-secret';
+    assert.doesNotMatch(redactLog(original), /private folder|visible-secret/);
+    assert.match(redactLog(original, false), /private folder/);
+    assert.doesNotMatch(redactLog(original, false), /visible-secret/);
+  });
+
+  await test('FR-16：能力矩阵覆盖三平台、三接口和八类文件系统', () => {
+    assert.equal(capabilityMatrix.length, 72);
+    assert.equal(new Set(capabilityMatrix.map((r) => `${r.platform}/${r.interface}/${r.filesystem}`)).size, 72);
+    assert.ok(capabilityMatrix.filter((r) => ['VHD', '加密容器', '压缩包内文件系统'].includes(r.filesystem)).every((r) => r.directRepair === '不支持'));
+  });
+
   console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
   if (failed > 0) process.exitCode = 1;
 }

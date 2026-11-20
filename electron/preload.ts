@@ -9,6 +9,7 @@ import type {
   ScanResult,
   SyncMode,
 } from '../shared/types';
+import type { AutoPairInput, AutoStatus } from '../shared/aut-types';
 
 export interface StartOptions {
   sourceRoot: string;
@@ -64,9 +65,23 @@ const api = {
 
   recover: (confirmed: boolean): Promise<AppState> => ipcRenderer.invoke('backup:recover', confirmed),
 
+  health: (root: string) => ipcRenderer.invoke('backup:health', root),
+  reenumerate: (root: string) => ipcRenderer.invoke('backup:reenumerate', root),
+  repairDryRun: (root: string, request: import('../shared/types').RepairRequest) => ipcRenderer.invoke('backup:repair-dry-run', root, request),
+  exportPartitionEvidence: (root: string) => ipcRenderer.invoke('backup:partition-evidence', root),
+  capabilities: () => ipcRenderer.invoke('backup:capabilities'),
+
   quarantine: (reason: string): Promise<AppState> => ipcRenderer.invoke('backup:quarantine', reason),
 
   releaseQuarantine: (): Promise<AppState> => ipcRenderer.invoke('backup:release-quarantine'),
+
+  autoSync: {
+    status: (): Promise<AutoStatus> => ipcRenderer.invoke('aut:status'),
+    configure: (pair: AutoPairInput): Promise<AutoStatus> => ipcRenderer.invoke('aut:configure', pair),
+    setEnabled: (enabled: boolean): Promise<AutoStatus> => ipcRenderer.invoke('aut:set-enabled', enabled),
+    resume: (): Promise<AutoStatus> => ipcRenderer.invoke('aut:resume'),
+    restore: (id: string): Promise<AutoStatus> => ipcRenderer.invoke('aut:restore', id),
+  },
 
   reveal: (targetPath: string): Promise<void> => ipcRenderer.invoke('app:reveal', targetPath),
 

@@ -3,6 +3,8 @@ import { getApi, type BackupAPI } from './lib/api';
 import { createMockApi } from './lib/mock';
 import { DirectoryPicker } from './components/DirectoryPicker';
 import { PlanPanel } from './components/PlanPanel';
+import { MediaDiagnostics } from './components/MediaDiagnostics';
+import { AutoSyncPanel } from './components/AutoSync';
 import { ProgressPanel } from './components/ProgressPanel';
 import { EventFeed } from './components/EventFeed';
 import { Splitter } from './components/Splitter';
@@ -276,6 +278,12 @@ export default function App() {
               />
             </div>
 
+            {api ? (
+              <div className="section">
+                <AutoSyncPanel api={api.autoSync} sourceRoot={sourceRoot} targetRoot={targetRoot} />
+              </div>
+            ) : null}
+
             <PlanPanel
               actions={state?.actions ?? []}
               copy={summary?.copy ?? 0}
@@ -383,6 +391,7 @@ export default function App() {
                 onRecover={() => void handleRecover()}
                 onReleaseQuarantine={() => void api.releaseQuarantine()}
               />
+              <MediaDiagnostics key={targetRoot} api={api} root={targetRoot} disabled={phase === 'running' || phase === 'paused'} />
             </div>
 
             <div className="section" style={{ flex: '1 1 auto', minHeight: 0 }}>

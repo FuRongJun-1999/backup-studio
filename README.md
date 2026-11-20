@@ -18,6 +18,11 @@
 | 拔盘恢复 | 目标介质掉线即停止写入并保全断点；介质回来后**不自动续传**，需用户确认并重新扫描 |
 | 同步语义可切换 | 运行时切换 `严格镜像` / `镜像并保留历史`（删除前归档到 `.backup-studio/history`） |
 | 删除风险闸门 | 源端为空或孤儿占比过高时强制二次确认，防止误选目录造成不可逆丢失 |
+| 逻辑健康检测 | 只读汇聚卷状态、NTFS 脏位、MBR/GPT 校验、备份索引与逐文件哈希；权限不足时明确标注「能力缺失」，不伪造健康结论 |
+| 统一写入闸门 | 手动备份与自动同步共用同一个闸门：介质不可达、隔离、L2、磁盘只读、卷需修复、卷健康无法判定，一律拒绝写入 |
+| 人工修复入口 | 只读预检 → 选卷 → 两次确认 → 免责 → 先镜像关键扇区 → 生成审计；**只演练不执行修复**，分区表只导出证据 |
+| 跨平台能力矩阵 | 3 平台 × 3 接口 × 8 文件系统共 72 组，标注可检测 / 可自动处理 / 仅告警 / 不支持 |
+| 自动备份（实时单向同步） | 带开关的单向同步：差异对账 + 事件监听，删除走独立回收站（≥7 天、容量上限）；写入许可由容灾闸门裁决 |
 | 虚拟列表 | 计划清单上限 20000 条，虚拟滚动渲染，十万级文件不打爆 IPC |
 
 ### 去重与改名判定链路
@@ -124,6 +129,9 @@ npm.cmd run dev:renderer   # 仅启动渲染层（Vite，端口 5273），window
 npm.cmd run typecheck      # 渲染层 + 主进程 + 测试目录类型检查
 npm.cmd run build          # 渲染层 Vite 构建 + 主进程 tsc 编译
 npm.cmd run test:engine    # 引擎测试（需先 build:electron，因为依赖编译后的 copyWorker.js）
+npm.cmd run test:aut       # 自动备份独立测试
+npm.cmd run test:gate      # 写入闸门与容灾桥接测试
+npm.cmd run test           # 一次跑完上面三套
 npm.cmd start              # 构建后启动 Electron
 npm.cmd run pack:win       # 打包 Windows NSIS 安装包 → release/
 npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
@@ -136,14 +144,18 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 
 ## CI 双平台构建
 
-- `.github/workflows/ci.yml` —— push / PR 触发：类型检查 → 构建 → 引擎测试
+- `.github/workflows/ci.yml` —— push / PR 触发：类型检查 → 构建 → 引擎测试 → 自动同步测试 → 写入闸门测试
 - `.github/workflows/release.yml` —— 打 tag `v*.*.*` 触发：Windows NSIS + Linux AppImage/deb 构建并上传 Release
 
 ---
 
-## 引擎测试
+## 测试
 
-`npm.cmd run test:engine` 覆盖 24 个场景：
+`npm.cmd run test` 一次跑完三套用例（共 53 项）：
+
+### 引擎测试 `npm.cmd run test:engine`
+
+覆盖 **35** 个场景：
 
 **基础备份与同步**
 
@@ -181,6 +193,28 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 
 24. 高风险删除触发二次确认闸门
 
+**逻辑健康检测与人工修复（FR-06 / FR-09 / FR-11 / FR-15 / FR-16）**
+
+25. FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造
+26. FR-06：探测不修改目标或本机账本，校验备份索引
+27. FR-06：只读校验 MBR 签名及条目边界
+28. FR-06：GPT 验证主备头及分区条目 CRC32
+29. FR-09：没有二次确认不启动只读预检、镜像或修复
+30. FR-09：审计请求后先生成镜像，结果无修复命令
+31. FR-11：重复枚举失败触发可撤销的隔离观察
+32. FR-15：权限不足拒绝高危演练但仍可查看卷证据
+33. FR-15：执行器和原始设备路径白名单不可注入
+34. FR-15：日志脱敏，配置允许路径但不允许凭据
+35. FR-16：能力矩阵覆盖三平台、三接口和八类文件系统
+
+### 自动备份测试 `npm.cmd run test:aut`
+
+覆盖 **10** 个场景：拒绝源内目标与反向包含、开关持久化与重新开启后补账、对账新增/修改/排除、350ms 去抖合并、受管删除入回收站且七天内可恢复、容量只清理到期且经逐项授权的内容、外部修改默认暂停不覆盖、复制前文件变化触发退避并最终重试、L2 禁止写入、卷仍在线但需要修复时拒写并传递证据。
+
+### 写入闸门测试 `npm.cmd run test:gate`
+
+覆盖 **8** 个场景：目标不可达时禁止写入、可达目标按卷级事实决定放行、卷需人工检查时标记 `repair-required` 并拒写、隔离观察时禁止写入、闸门结论不变时 `epoch` 稳定而结论变化时 `epoch` 改变、卷健康未知一律拒写、仅在完整校验证明备份集完好时才授权清理回收项、许可对象满足自动备份的拒写契约。
+
 ---
 
 ## 界面规范落地清单
@@ -208,9 +242,13 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 ## 已知限制
 
 - Linux 二进制需在 Linux 上构建，或使用仓库内的 GitHub Actions 矩阵产出；本机无 Linux 交叉环境。
+- **自动备份目前只在 Windows 可用**：卷级健康检查依赖 `Get-Volume` / `fsutil`，Linux 与 macOS 无对应能力，按「不确定时默认只读、不得自动写盘」拒绝写入。手动备份不受此限制。
+- **卷需人工检查时全部写入路径都被阻断**：卷处于 `Full Repair Needed` 或 NTFS 脏位时，手动备份与自动备份都会拒写，需先由人工在系统层处理再重新对账。
 - `worker_threads` 受 Electron 单进程架构限制，无法通过多进程进一步提升并行度；瓶颈通常在磁盘而非线程数。
 - 目标介质为网络盘 / SMB 时，续传需回读并逐块哈希 `.part`，会放大网络往返开销。
 - 渲染层 mock 后端仅供浏览器预览界面，不参与真实备份。
+- 真实 Electron 原生窗口尚未取证，界面证据仍取自渲染层浏览器。
+- 诊断包导出、审计日志、备用介质切换、多配对调度尚未实现。
 
 ## License
 

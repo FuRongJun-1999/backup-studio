@@ -99,6 +99,68 @@ export interface LogEntry extends LogLevel {
   ts: number;
 }
 
+export interface HealthReport {
+  assessment: MediaAssessment;
+  condition: 'unreachable' | 'filesystem-repair' | 'media-unavailable' | 'verified' | 'uncertain';
+  permission: boolean;
+  /** 操作系统报告的磁盘写保护；null 表示能力缺失。 */
+  diskReadOnly?: boolean | null;
+  volume: string | null;
+  smart: '能力缺失' | '有基线';
+  index: '完整' | '截断' | '缺失' | '索引不一致' | '未验证';
+  files: { complete: number; truncated: number; missing: number; mismatch: number; unchecked: number };
+}
+
+/**
+ * 写入闸门结果。
+ *
+ * 手动备份与自动备份共用这一套判定，避免出现第二套写入规则而相互漂移。
+ * 条件与 `guardTargetWrites` 一致：L2、磁盘只读、卷需修复、隔离中，一律禁止写入。
+ */
+export interface WriteGate {
+  allowed: boolean;
+  /** 目标根是否可达 */
+  reachable: boolean;
+  /** 是否处于隔离观察（未撤销） */
+  isolated: boolean;
+  /** 容灾判定等级；无法判定时为 unknown */
+  level: 'L0' | 'L1' | 'L2' | 'unknown';
+  /**
+   * 卷级健康：
+   * - healthy：已取得卷级事实且未发现风险
+   * - repair-required：已确认需人工修复
+   * - unknown：无法判定（权限不足、平台不支持、设备不可达）——不得伪造为 healthy
+   */
+  volumeHealth: 'healthy' | 'repair-required' | 'unknown';
+  reason?: string;
+  evidence: string[];
+}
+
+export interface RepairRequest {
+  volume: string;
+  confirmed: boolean;
+  confirmedAgain: boolean;
+  disclaimerAccepted: boolean;
+}
+
+export interface RepairResult {
+  mode: 'dry-run';
+  auditId: string;
+  volume: string;
+  imageCreated: boolean;
+  guidance: string;
+}
+
+export type CapabilityStatus = '可检测' | '可自动处理' | '仅告警' | '不支持';
+export interface CapabilityRow {
+  platform: string;
+  interface: string;
+  filesystem: string;
+  detection: CapabilityStatus;
+  backupSet: CapabilityStatus;
+  directRepair: CapabilityStatus;
+}
+
 export interface AppState {
   phase: BackupPhase;
   media: MediaState;

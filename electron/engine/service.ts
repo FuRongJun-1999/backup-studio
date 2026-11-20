@@ -3,12 +3,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { inspectHealth, preflightImage } from './health';
+import { rehearseRepair } from './repair';
+import { driveLetter, redactLog } from './security';
+import { writeJsonAtomic } from './manifest';
 import { scanTree, META_DIR } from './scan';
 import { buildPlan, type PlanResult } from './planner';
 import { CopyPool, type CopyResult } from './pool';
 import { JournalStore, partFileName, type Journal, type JournalTask } from './journal';
 import {
-  assessMedia,
   probeMedia,
   sameMedia,
   MEDIA_ERROR_CODES,
@@ -35,6 +38,7 @@ import type {
   RecoverableJob,
   ScanResult,
   SyncMode,
+  WriteGate,
 } from '../../shared/types';
 
 /** 判定为「介质不可用」的错误码：拔盘、拔出 USB、总线错误 */
@@ -94,6 +98,10 @@ export class BackupService extends EventEmitter {
   private logSeq = 0;
   private pendingTasks = new Map<string, JournalTask>();
   private running = false;
+  private diagnosing = false;
+  private failedRechecks = 0;
+  private readonly baseline = new Map<string, { identity?: string; readErrors?: number; writeErrors?: number; temperature?: number; wear?: number }>();
+  private blockedTargets = new Set<string>();
   private cancelled = false;
   private mediaLost = false;
   private journalDirty = false;
@@ -167,7 +175,7 @@ export class BackupService extends EventEmitter {
   }
 
   private log(level: LogLevel['level'], text: string): void {
-    const entry: LogEntry = { id: (this.logSeq += 1), ts: now(), level, text };
+    const entry: LogEntry = { id: (this.logSeq += 1), ts: now(), level, text: redactLog(text, process.env.BACKUP_STUDIO_LOG_PATHS !== '1', [this.state.sourceRoot, this.state.targetRoot, this.journal.baseDir]) };
     this.state.logs = [...this.state.logs.slice(-400), entry];
     this.emit('log', entry);
   }
@@ -351,6 +359,7 @@ export class BackupService extends EventEmitter {
     if (this.running) throw new Error('已有备份任务正在执行');
 
     const { sourceRoot, targetRoot, syncMode } = options;
+    if (this.diagnosing) throw new Error('介质检测正在进行');
     const plan = this.currentPlan;
     const identity = this.plannedMedia;
     if (!plan || !identity || this.state.phase !== 'ready' ||
@@ -365,13 +374,17 @@ export class BackupService extends EventEmitter {
       throw new Error('该介质处于隔离观察状态，已禁止写入。请先撤销隔离再继续。');
     }
 
-    const previous = await this.journal.getActive();
-    if (previous?.interruption && previous.targetRoot === targetRoot) {
-      // 中断后必须重新扫描生成新计划：旧计划里的删除动作一律作废
-      throw new Error('检测到上次中断记录，请重新扫描以生成新的备份计划后再开始。');
-    }
-
     this.running = true;
+    try {
+      const previous = await this.journal.getActive();
+      if (previous?.interruption && previous.targetRoot === targetRoot) {
+        throw new Error('检测到上次中断记录，请重新扫描以生成新的备份计划后再开始。');
+      }
+      await this.guardTargetWrites(targetRoot);
+    } catch (error) {
+      this.running = false;
+      throw error;
+    }
     this.cancelled = false;
     this.mediaLost = false;
     this.ioErrors = 0;
@@ -480,6 +493,9 @@ export class BackupService extends EventEmitter {
       throw new Error('介质判定为 L2，已隔离并禁止写入。');
     }
 
+    if (this.blockedTargets.has(await this.targetRiskKey(job.targetRoot))) {
+      throw new Error('卷需人工检查，仍须保持只读；中断账本已保留。');
+    }
     this.log('info', '开始恢复备份：正在重新扫描并生成新计划');
 
     // Invalidate the old plan. The worker will validate the on-disk chunks against the source.
@@ -499,23 +515,137 @@ export class BackupService extends EventEmitter {
     });
   }
 
-  /** 对目标介质做只读检测并输出判定 */
-  async assessTarget(targetRoot: string): Promise<MediaAssessment> {
-    const probe = await probeMedia(targetRoot);
-    this.lastProbe = probe;
-    const manifestReadable = await readManifest(targetRoot).then(() => true).catch(() => false);
-    const job = await this.journal.getActive();
-    const assessment = assessMedia({
-      probe,
-      expected: job?.mediaIdentity ?? this.plannedMedia,
-      manifestReadable,
-      ioErrors: this.ioErrors,
-      verifyFailures: this.verifyFailures,
-      quarantined: Boolean(this.state.quarantine && !this.state.quarantine.released),
+  /** 诊断与镜像只对当前目录开放，与备份写入互斥。 */
+  private async diagnostic<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.running || this.diagnosing) throw new Error('备份或检测正在进行');
+    this.diagnosing = true;
+    try { return await fn(); } finally { this.diagnosing = false; }
+  }
+
+  private async inspectTarget(targetRoot: string, quick = false) {
+    const active = await this.journal.getActive();
+    const job = active?.targetRoot === targetRoot ? active : null;
+    const relevant = this.state.targetRoot === targetRoot;
+    const report = await inspectHealth(targetRoot, {
+      store: this.journal, job, quick, baseline: this.baseline,
+      expected: job?.mediaIdentity ?? (relevant ? this.expectedMedia ?? this.plannedMedia : null),
+      ioErrors: relevant ? this.ioErrors : 0, verifyFailures: relevant ? this.verifyFailures : 0,
+      quarantined: Boolean(this.state.quarantine && !this.state.quarantine.released && await this.targetRiskKey(this.state.quarantine.targetRoot) === await this.targetRiskKey(targetRoot)),
     });
-    this.state.assessment = assessment;
+    const riskKey = await this.targetRiskKey(targetRoot);
+    if (report.condition === 'filesystem-repair') this.blockedTargets.add(riskKey);
+    if (report.condition === 'verified' && report.assessment.level === 'L0') this.blockedTargets.delete(riskKey);
+    this.state.assessment = report.assessment;
     this.emitState();
-    return assessment;
+    return report;
+  }
+
+  private async targetRiskKey(targetRoot: string): Promise<string> {
+    const canonical = await fs.realpath(targetRoot).catch(() => path.resolve(targetRoot));
+    return process.platform === 'win32' ? driveLetter(canonical) ?? canonical.toLowerCase() : canonical;
+  }
+
+  private async guardTargetWrites(targetRoot: string): Promise<void> {
+    const report = process.platform === 'win32' ? await this.inspectTarget(targetRoot, true) : undefined;
+    const riskKey = await this.targetRiskKey(targetRoot);
+    const mark = this.state.quarantine;
+    if (report?.assessment.level === 'L2' || report?.diskReadOnly === true || this.blockedTargets.has(riskKey) || (mark && !mark.released && await this.targetRiskKey(mark.targetRoot) === riskKey)) {
+      throw new Error('当前目标存在只读风险，禁止写入；请查看介质证据。');
+    }
+  }
+
+  /**
+   * 写入闸门：供自动备份等外部写入方裁决是否允许写入。
+   *
+   * 判定条件与 `guardTargetWrites` 完全一致（L2、磁盘只读、卷需修复、隔离中一律拒绝），
+   * 避免手动备份与自动备份出现两套互相漂移的写入规则。
+   */
+  async writeGate(targetRoot: string): Promise<WriteGate> {
+    const report = await this.inspectTarget(targetRoot, true);
+    const riskKey = await this.targetRiskKey(targetRoot);
+    const mark = this.state.quarantine;
+    const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
+    const level = report.assessment.level;
+    const reachable = report.condition !== 'unreachable';
+    const readOnly = report.diskReadOnly === true;
+    const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
+    // 只有确实取到卷级事实且未发现问题时才敢称「健康」；否则标注能力缺失，不伪造健康结论。
+    const volumeChecked = reachable && report.volume !== null && !readOnly && !repairNeeded;
+    const volumeHealth: WriteGate['volumeHealth'] = repairNeeded ? 'repair-required' : volumeChecked ? 'healthy' : 'unknown';
+    // 自动写入必须建立在「确定无卷级风险」之上：卷健康无法判定时按默认只读处理（需求 §3.2）。
+    const allowed = reachable && !isolated && level !== 'L2' && !readOnly && !repairNeeded && volumeHealth === 'healthy';
+
+    let reason: string | undefined;
+    if (!reachable) reason = '目标介质不可达';
+    else if (isolated) reason = '介质处于隔离观察，禁止写入';
+    else if (level === 'L2') reason = '容灾判定为 L2，禁止写入';
+    else if (readOnly) reason = '系统报告磁盘为只读';
+    else if (repairNeeded) reason = '卷需要人工检查，禁止写入；处理完成并重新对账后再继续';
+    else if (volumeHealth === 'unknown') reason = '未能确认卷健康（权限不足或当前平台不支持卷级检查），按默认只读处理；自动写入已禁止';
+
+    const evidence = report.assessment.evidence.map((item) => `${item.kind}：${item.detail}`);
+    if (report.assessment.suggestion) evidence.push(`建议：${report.assessment.suggestion}`);
+    return { allowed, reachable, isolated, level, volumeHealth, reason, evidence };
+  }
+
+  async health(targetRoot: string) {
+    if (typeof targetRoot !== 'string' || !path.isAbsolute(targetRoot) || !targetRoot.trim()) throw new Error('请选择本机目标目录');
+    return this.diagnostic(() => this.inspectTarget(targetRoot));
+  }
+
+  async assessTarget(targetRoot: string): Promise<MediaAssessment> {
+    return (await this.health(targetRoot)).assessment;
+  }
+
+  async reenumerate(targetRoot: string) {
+    if (typeof targetRoot !== 'string' || !path.isAbsolute(targetRoot)) throw new Error('请选择本机目标目录');
+    return this.diagnostic(async () => {
+      const report = await this.inspectTarget(targetRoot);
+      const extra = { kind: '重新枚举', detail: '刷新应用检测；不重置控制器。若异常持续，请更换 USB 端口、线缆或主机后重试。', at: now() };
+      report.assessment.evidence.push(extra);
+      if (this.state.targetRoot === targetRoot) {
+        if (report.condition === 'verified' && report.assessment.level === 'L0') {
+          this.failedRechecks = 0;
+          this.currentPlan = null;
+          this.plannedMedia = null;
+          this.setMedia('restoring');
+          this.log('info', '分层校验通过，解除介质探测告警；保留中断账本，恢复须确认并重扫');
+        } else if (report.condition === 'media-unavailable' || (report.condition === 'unreachable' && ++this.failedRechecks >= MEDIA_LOSS_THRESHOLD)) {
+          await this.quarantine(targetRoot, '重新枚举仍不可用，请核查证据并尝试换口、换线或换主机');
+        }
+      }
+      this.emitState();
+      return report;
+    });
+  }
+
+  async repairDryRun(targetRoot: string, request: import('../../shared/types').RepairRequest) {
+    if (process.platform !== 'win32' || targetRoot !== this.state.targetRoot || !driveLetter(targetRoot)) throw new Error('请选择当前 Windows 目标所在的作用卷');
+    return this.diagnostic(async () => {
+      const local = await this.diagnosticsDir(targetRoot);
+      return rehearseRepair(request, () => this.inspectTarget(targetRoot), preflightImage, path.join(local, 'repair'));
+    });
+  }
+
+  async exportPartitionEvidence(targetRoot: string): Promise<{ auditId: string; guidance: string }> {
+    if (typeof targetRoot !== 'string' || !path.isAbsolute(targetRoot)) throw new Error('请选择本机目标目录');
+    return this.diagnostic(async () => {
+      const local = await this.diagnosticsDir(targetRoot);
+      const report = await this.inspectTarget(targetRoot);
+      const auditId = randomUUID();
+      const guidance = '先保留完整备份和盘上现场。请由管理员核对分区边界和主备表；本应用不会写回分区表，也不支持对容器直接执行 fsck。';
+      await writeJsonAtomic(path.join(local, 'evidence', `${auditId}.json`), { ...report, assessment: { ...report.assessment, evidence: report.assessment.evidence.filter((x) => x.kind !== '介质身份') }, guidance });
+      return { auditId, guidance };
+    });
+  }
+
+  private async diagnosticsDir(targetRoot: string): Promise<string> {
+    const local = await fs.realpath(this.journal.baseDir);
+    const target = await fs.realpath(targetRoot).catch(() => targetRoot);
+    const relative = path.relative(target, local);
+    if (!relative || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))) throw new Error('本机诊断目录位于目标备份内，已禁止写入');
+    if (process.platform === 'win32' && driveLetter(local) === driveLetter(target)) throw new Error('本机诊断目录与目标位于同一卷，已禁止写入');
+    return local;
   }
 
   /** 最近一次只读探测的结果 */
@@ -1186,7 +1316,10 @@ export class BackupService extends EventEmitter {
   async cleanupMeta(): Promise<void> {
     const targetRoot = this.state.targetRoot;
     if (!targetRoot) return;
-    await fs.rm(path.join(targetRoot, META_DIR), { recursive: true, force: true }).catch(() => undefined);
+    await this.diagnostic(async () => {
+      await this.guardTargetWrites(targetRoot);
+      await fs.rm(path.join(targetRoot, META_DIR), { recursive: true, force: true });
+    });
     this.log('info', '已清除目标端的备份元数据');
   }
 }
