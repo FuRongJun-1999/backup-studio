@@ -144,8 +144,8 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 
 ## CI 双平台构建
 
-- `.github/workflows/ci.yml` —— push / PR 触发：类型检查 → 构建 → 引擎测试 → 自动同步测试 → 写入闸门测试
-- `.github/workflows/release.yml` —— 打 tag `v*.*.*` 触发：Windows NSIS + Linux AppImage/deb 构建并上传 Release
+- `.github/workflows/ci.yml` —— push / PR 触发：类型检查 → 构建 → 引擎测试 → 自动同步测试 → 写入闸门测试（已实际运行通过）
+- `.github/workflows/release.yml` —— 打 tag `v*.*.*` 触发：Windows NSIS + Linux AppImage/deb 构建并上传 Release（**尚未执行验证**）
 
 ---
 
@@ -241,7 +241,7 @@ npm.cmd run pack:linux     # 打包 Linux AppImage + deb → release/
 
 ## 已知限制
 
-- Linux 二进制需在 Linux 上构建，或使用仓库内的 GitHub Actions 矩阵产出；本机无 Linux 交叉环境。
+- Linux 二进制需在 Linux 上构建，或使用仓库内的 GitHub Actions 矩阵产出；本机无 Linux 交叉环境，`release.yml` 尚未实际执行验证。
 - **自动备份目前只在 Windows 可用**：卷级健康检查依赖 `Get-Volume` / `fsutil`，Linux 与 macOS 无对应能力，按「不确定时默认只读、不得自动写盘」拒绝写入。手动备份不受此限制。
 - **卷需人工检查时全部写入路径都被阻断**：卷处于 `Full Repair Needed` 或 NTFS 脏位时，手动备份与自动备份都会拒写，需先由人工在系统层处理再重新对账。
 - `worker_threads` 受 Electron 单进程架构限制，无法通过多进程进一步提升并行度；瓶颈通常在磁盘而非线程数。
