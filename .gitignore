@@ -1,0 +1,24 @@
+node_modules/
+dist/
+dist-electron/
+release/
+*.log
+.DS_Store
+Thumbs.db
+
+# 源码归档包：由本仓库源码打包生成，重复入库无意义
+backup-studio-*.zip
+
+# 演练与备份元数据目录（真实掉盘演练产物）
+.drill/
+.backup-studio/
+
+# 原子写入残留的临时件
+*.tmp-*
+
+# 嵌套参考仓库：另一项目的检出，不应进入本仓库
+_refs/
+
+# 本地环境与凭据
+.env
+.env.*

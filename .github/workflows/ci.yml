@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build renderer
+        run: npm run build:renderer
+
+      # 引擎测试依赖编译后的 dist-electron/electron/engine/copyWorker.js
+      - name: Build electron
+        run: npm run build:electron
+
+      - name: Engine tests
+        run: npm run test:engine
